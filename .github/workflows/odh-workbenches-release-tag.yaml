@@ -11,8 +11,8 @@ on:
 permissions: {}
 
 env:
-  REPO_ORG: opendatahub-io
-  REPO_NAME: workbenches
+  # Derived from the repo where the workflow runs — works correctly on forks.
+  REPO: ${{ github.repository }}
   # Tekton push file containing the output-image tag (used in steps below).
   TEKTON_PUSH_FILE: .tekton/odh-workbenches-controller-push.yaml
   # Full image reference (registry/org/name) without tag.
@@ -63,7 +63,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.extract-version.outputs.version }}
         run: |
-          if gh release view "$VERSION" --repo "$REPO_ORG/$REPO_NAME" &>/dev/null; then
+          if gh release view "$VERSION" --repo "$REPO" &>/dev/null; then
             echo "Release $VERSION already exists, skipping"
             echo "exists=true" >> $GITHUB_OUTPUT
           else
@@ -78,7 +78,7 @@ jobs:
           VERSION: ${{ steps.extract-version.outputs.version }}
         run: |
           gh release create "$VERSION" \
-            --repo "$REPO_ORG/$REPO_NAME" \
+            --repo "$REPO" \
             --title "$VERSION" \
             --target "${{ github.sha }}" \
             --generate-notes
@@ -87,4 +87,4 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Version:** \`$VERSION\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Release URL:** https://github.com/$REPO_ORG/$REPO_NAME/releases/tag/$VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "**Release URL:** https://github.com/$REPO/releases/tag/$VERSION" >> $GITHUB_STEP_SUMMARY
