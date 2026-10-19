@@ -22,12 +22,41 @@ env:
   PARAMS_ENV_KEY: WORKBENCH_CONTROLLER_IMAGE
 
 jobs:
+  # Detect whether this push is a release commit by checking if the runtime image
+  # pin file was changed.
+  detect-release:
+    name: Detect release commit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      is_release: ${{ steps.check.outputs.is_release }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+
+      - name: Check if runtime image pin was promoted
+        id: check
+        run: |
+          # A release commit always bumps the runtime image pin in PARAMS_ENV_FILE.
+          # Regular Tekton-only bumps leave that file untouched.
+          if git diff --name-only HEAD^ HEAD | grep -qF "$PARAMS_ENV_FILE"; then
+            echo "is_release=true" >> $GITHUB_OUTPUT
+            echo "Runtime image pin file changed — treating this as a release commit"
+          else
+            echo "is_release=false" >> $GITHUB_OUTPUT
+            echo "Runtime image pin file not changed — skipping release creation"
+          fi
+
   create-release:
     name: Create GitHub Release
+    needs: detect-release
+    if: ${{ needs.detect-release.outputs.is_release == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    if: "${{ startsWith(github.event.head_commit.message, 'chore: release ') }}"
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
