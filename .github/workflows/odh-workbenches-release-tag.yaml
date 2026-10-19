@@ -22,12 +22,64 @@ env:
   PARAMS_ENV_KEY: WORKBENCH_CONTROLLER_IMAGE
 
 jobs:
+  # Detect whether this push promoted the runtime image pin.
+  detect-release:
+    name: Detect release commit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      is_release: ${{ steps.check.outputs.is_release }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Fetch pre-push SHA for comparison
+        run: |
+          BEFORE="${{ github.event.before }}"
+          # The zero SHA appears on the very first push to a new branch; nothing to compare.
+          if [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            git fetch --depth=1 origin "$BEFORE"
+          fi
+
+      - name: Check if runtime image pin value was promoted
+        id: check
+        run: |
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+
+          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "is_release=false" >> $GITHUB_OUTPUT
+            echo "First push to branch — no previous commit to compare against"
+            exit 0
+          fi
+
+          # Extract the pin value at each end of the push range.
+          OLD_PIN=$(git show "${BEFORE}:${PARAMS_ENV_FILE}" 2>/dev/null \
+            | grep -oP "${PARAMS_ENV_KEY}=\K.*" || echo "")
+          NEW_PIN=$(git show "${AFTER}:${PARAMS_ENV_FILE}" 2>/dev/null \
+            | grep -oP "${PARAMS_ENV_KEY}=\K.*" || echo "")
+
+          echo "Pin before push: '${OLD_PIN}'"
+          echo "Pin after push:  '${NEW_PIN}'"
+
+          if [ -n "$NEW_PIN" ] && [ "$OLD_PIN" != "$NEW_PIN" ]; then
+            echo "is_release=true" >> $GITHUB_OUTPUT
+            echo "Runtime image pin changed — treating this as a release commit"
+          else
+            echo "is_release=false" >> $GITHUB_OUTPUT
+            echo "Runtime image pin unchanged — skipping release creation"
+          fi
+
   create-release:
     name: Create GitHub Release
+    needs: detect-release
+    if: ${{ needs.detect-release.outputs.is_release == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    if: "${{ startsWith(github.event.head_commit.message, 'chore: release ') }}"
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

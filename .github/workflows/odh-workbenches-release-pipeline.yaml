@@ -28,11 +28,29 @@ env:
   PARAMS_ENV_KEY: WORKBENCH_CONTROLLER_IMAGE
 
 jobs:
+  validate-input:
+    name: Validate version input
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Validate version format
+        env:
+          NEW_VERSION: ${{ inputs.new-image-version }}
+        run: |
+          # Validate version format (alphanumeric, dots, underscores, hyphens only)
+          if ! [[ "$NEW_VERSION" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+            echo "::error::Invalid version format: $NEW_VERSION"
+            echo "Version must contain only alphanumeric characters, dots, underscores, and hyphens"
+            exit 1
+          fi
+          echo "Version format validated: $NEW_VERSION"
+
   # Step 1 (Optional): Sync main -> stable
   # Disabled by default - branch syncs should follow Bodies of Water approach
   # where syncs happen asynchronously and are gated by test results.
   sync-main-to-stable:
     name: Sync main to stable
+    needs: validate-input
     permissions:
       contents: write
     if: ${{ inputs.allow-sync }}
@@ -44,41 +62,27 @@ jobs:
   # Step 2 (Optional): Sync stable -> v2.x
   sync-stable-to-release:
     name: Sync stable to release branch
+    needs: sync-main-to-stable
     permissions:
       contents: write
     if: ${{ inputs.allow-sync }}
-    needs: sync-main-to-stable
     uses: opendatahub-io/workbenches/.github/workflows/sync-branches.yaml@main
     with:
       source: "stable"
       target: "v2.x"
 
-  # Step 3: Update image versions and create PR
-  update-and-create-pr:
-    name: Update image versions and create PR
-    needs: sync-stable-to-release
+  # Step 3: Update image versions and push the release branch.
+  push-branch:
+    name: Update image versions and push branch
+    needs: [validate-input, sync-stable-to-release]
     if: ${{ always() && !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      pull-requests: write
     outputs:
-      pr_url: ${{ steps.create-pr.outputs.pr_url }}
-      pr_number: ${{ steps.create-pr.outputs.pr_number }}
+      branch_name: ${{ steps.create-branch.outputs.branch_name }}
       release_version: ${{ steps.extract-tags.outputs.controller_tag }}
     steps:
-      - name: Validate version input
-        env:
-          NEW_VERSION: ${{ inputs.new-image-version }}
-        run: |
-          # Validate version format (alphanumeric, dots, underscores, hyphens only)
-          if ! [[ "$NEW_VERSION" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-            echo "Invalid version format: $NEW_VERSION"
-            echo "Version must contain only alphanumeric characters, dots, underscores, and hyphens"
-            exit 1
-          fi
-          echo "Version format validated: $NEW_VERSION"
-
       - name: Checkout release branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -136,9 +140,20 @@ jobs:
         env:
           CONTROLLER_TAG: ${{ steps.extract-tags.outputs.controller_tag }}
         run: |
+          COUNT=$(grep -c "${PARAMS_ENV_KEY}=${IMAGE_REF}:" "$PARAMS_ENV_FILE" || true)
+          if [ "$COUNT" -ne 1 ]; then
+            echo "::error::Expected exactly 1 match for ${PARAMS_ENV_KEY}=${IMAGE_REF}: in ${PARAMS_ENV_FILE}, found ${COUNT}"
+            exit 1
+          fi
+
           # Promote the current tekton tag into the runtime image pin
           sed -i "s|${PARAMS_ENV_KEY}=${IMAGE_REF}:.*|${PARAMS_ENV_KEY}=${IMAGE_REF}:${CONTROLLER_TAG}|" \
             "$PARAMS_ENV_FILE"
+
+          if ! grep -q "${PARAMS_ENV_KEY}=${IMAGE_REF}:${CONTROLLER_TAG}" "$PARAMS_ENV_FILE"; then
+            echo "::error::Substitution failed — ${PARAMS_ENV_KEY}=${IMAGE_REF}:${CONTROLLER_TAG} not found in ${PARAMS_ENV_FILE}"
+            exit 1
+          fi
 
           echo "Updated ${PARAMS_ENV_FILE} with current tekton tag: ${CONTROLLER_TAG}"
 
@@ -146,9 +161,20 @@ jobs:
         env:
           NEW_VERSION: ${{ inputs.new-image-version }}
         run: |
+          COUNT=$(grep -c "value: ${IMAGE_REF}:" "$TEKTON_PUSH_FILE" || true)
+          if [ "$COUNT" -ne 1 ]; then
+            echo "::error::Expected exactly 1 match for value: ${IMAGE_REF}: in ${TEKTON_PUSH_FILE}, found ${COUNT}"
+            exit 1
+          fi
+
           # Bump the tekton push file to track the next version
           sed -i "s|value: ${IMAGE_REF}:.*|value: ${IMAGE_REF}:${NEW_VERSION}|" \
             "$TEKTON_PUSH_FILE"
+
+          if ! grep -q "value: ${IMAGE_REF}:${NEW_VERSION}" "$TEKTON_PUSH_FILE"; then
+            echo "::error::Substitution failed — value: ${IMAGE_REF}:${NEW_VERSION} not found in ${TEKTON_PUSH_FILE}"
+            exit 1
+          fi
 
           echo "Updated ${TEKTON_PUSH_FILE} with new version: ${NEW_VERSION}"
 
@@ -158,6 +184,7 @@ jobs:
           git diff
 
       - name: Create branch and commit changes
+        id: create-branch
         env:
           # Release version is the current tekton tag being promoted to params.env,
           # not the NEXT version used to bump tekton for future builds.
@@ -177,19 +204,35 @@ jobs:
 
           git push origin "$BRANCH_NAME"
 
-          echo "branch_name=$BRANCH_NAME" >> $GITHUB_ENV
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
 
+  # Step 4: Open the Pull Request.
+  # Scoped to pull-requests: write only — the branch was already pushed above.
+  # Needs always() guard for the same reason as push-branch: the skipped sync
+  # jobs propagate transitively and would otherwise skip this job too.
+  create-pr:
+    name: Create Pull Request
+    needs: push-branch
+    if: ${{ always() && needs.push-branch.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    outputs:
+      pr_url: ${{ steps.create-pr.outputs.pr_url }}
+      pr_number: ${{ steps.create-pr.outputs.pr_number }}
+    steps:
       - name: Create Pull Request
         id: create-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_VERSION: ${{ steps.extract-tags.outputs.controller_tag }}
+          RELEASE_VERSION: ${{ needs.push-branch.outputs.release_version }}
           NEW_VERSION: ${{ inputs.new-image-version }}
+          BRANCH_NAME: ${{ needs.push-branch.outputs.branch_name }}
         run: |
           PR_URL=$(gh pr create \
             --repo "$REPO" \
             --base "$RELEASE_BRANCH" \
-            --head "$branch_name" \
+            --head "$BRANCH_NAME" \
             --title "chore: release ${RELEASE_VERSION}" \
             --body "## Release ${RELEASE_VERSION}
 
@@ -219,15 +262,15 @@ jobs:
 
   summary:
     name: Release Pipeline Summary
-    needs: update-and-create-pr
-    if: ${{ always() && needs.update-and-create-pr.result == 'success' }}
+    needs: [push-branch, create-pr]
+    if: ${{ always() && needs.create-pr.result == 'success' }}
     runs-on: ubuntu-latest
     permissions: {}
     steps:
       - name: Output summary
         env:
-          PR_URL: ${{ needs.update-and-create-pr.outputs.pr_url }}
-          RELEASE_VERSION: ${{ needs.update-and-create-pr.outputs.release_version }}
+          PR_URL: ${{ needs.create-pr.outputs.pr_url }}
+          RELEASE_VERSION: ${{ needs.push-branch.outputs.release_version }}
           NEW_VERSION: ${{ inputs.new-image-version }}
         run: |
           echo "## ODH Workbenches Release Pipeline Summary" >> $GITHUB_STEP_SUMMARY
